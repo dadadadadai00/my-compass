@@ -11,6 +11,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -37,30 +38,69 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var hasGravity = false
     private var hasMagnet = false
 
+    // 目標角度と、液体コンパス物理演算用の現在角度・角速度
     private var targetAzimuth = 0f
     private var displayAzimuth = 0f
+    private var angularVelocity = 0f
+    private var lastFrameTimeMs = 0L
+
     private var isUprightMode = false
     private var magnetAccuracyText = "計測中..."
 
+    private lateinit var rootLayout: LinearLayout
     private lateinit var modeBadgeText: TextView
     private lateinit var compassView: CompassDialView
     private lateinit var degreeText: TextView
     private lateinit var directionText: TextView
     private lateinit var sensorStatusText: TextView
 
+    // 60fpsで「スーッと動いて少し通り過ぎ、スーッと戻る」液体コンパス物理ループ
+    private val physicsRunnable = object : Runnable {
+        override fun run() {
+            val now = SystemClock.uptimeMillis()
+            if (lastFrameTimeMs == 0L) lastFrameTimeMs = now
+            val dt = ((now - lastFrameTimeMs) / 1000f).coerceIn(0.001f, 0.05f)
+            lastFrameTimeMs = now
+
+            if (hasGravity && hasMagnet) {
+                // 359°と0°の境界をまたぐ最短角度差（-180°〜+180°）
+                var diff = targetAzimuth - displayAzimuth
+                while (diff < -180f) diff += 360f
+                while (diff > 180f) diff -= 360f
+
+                // 不足減衰バネモデル（少し通り過ぎてから滑らかに収束する設定）
+                val stiffness = 22.0f // 目標へ向かうバネの強さ
+                val damping = 4.6f    // オイルの粘り気（小さいほど大きく通り過ぎる）
+
+                val angularAccel = (diff * stiffness) - (angularVelocity * damping)
+                angularVelocity += angularAccel * dt
+                displayAzimuth = (displayAzimuth + angularVelocity * dt + 360f) % 360f
+
+                // ほぼ静止している時の極小の揺れをピタッと止める
+                if (abs(diff) < 0.35f && abs(angularVelocity) < 0.8f) {
+                    angularVelocity = 0f
+                }
+
+                updateUI()
+            }
+
+            rootLayout.postOnAnimation(this)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // 全Android端末の画面サイズ・システムバーに自動フィットする1画面レイアウト
-        val root = LinearLayout(this).apply {
+        rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0B1528"))
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
         // 上下のカメラ穴・ナビゲーションバーを避けて内側に収める
-        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val padH = dp(16)
             view.setPadding(bars.left + padH, bars.top + dp(12), bars.right + padH, bars.bottom + dp(12))
@@ -130,10 +170,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         bottomBox.addView(degreeText)
         bottomBox.addView(sensorStatusText)
 
-        root.addView(topBox)
-        root.addView(compassView)
-        root.addView(bottomBox)
-        setContentView(root)
+        rootLayout.addView(topBox)
+        rootLayout.addView(compassView)
+        rootLayout.addView(bottomBox)
+        setContentView(rootLayout)
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -143,20 +183,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         accelSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         magnetSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         if (accelSensor == null || magnetSensor == null) {
             sensorStatusText.text = "⚠️ この端末には必要な磁気/加速度センサーがありません"
             sensorStatusText.setTextColor(Color.parseColor("#F87171"))
         }
+        lastFrameTimeMs = 0L
+        rootLayout.postOnAnimation(physicsRunnable)
     }
 
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(this)
+        rootLayout.removeCallbacks(physicsRunnable)
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
@@ -171,7 +214,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        val alpha = 0.15f // 針のブレを抑える平滑化係数
+        // 手の細かな震えをカットする強めのローパスフィルタ
+        val alpha = 0.08f
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
                 if (!hasGravity) {
@@ -199,8 +243,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val rotationMatrix = FloatArray(9)
             val orientationAngles = FloatArray(3)
             if (SensorManager.getRotationMatrix(rotationMatrix, null, gravity, geomagnetic)) {
-                // スマホを45度以上立てて持っているか自動判定（Z軸重力が5.0未満なら立て持ち）
-                isUprightMode = abs(gravity[2]) < 5.0f
+                // 45度付近でのパタパタ切り替えを防ぐバッファ（ヒステリシス）
+                val z = abs(gravity[2])
+                if (!isUprightMode && z < 4.2f) {
+                    isUprightMode = true
+                } else if (isUprightMode && z > 5.8f) {
+                    isUprightMode = false
+                }
 
                 val finalMatrix = FloatArray(9)
                 if (isUprightMode) {
@@ -218,20 +267,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 var deg = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
                 if (deg < 0f) deg += 360f
                 targetAzimuth = deg
-
-                // 359°と0°の境界で逆回転しない最短角度補間
-                var diff = targetAzimuth - displayAzimuth
-                while (diff < -180f) diff += 360f
-                while (diff > 180f) diff -= 360f
-                displayAzimuth = (displayAzimuth + diff * 0.25f + 360f) % 360f
-
-                updateUI()
             }
         }
     }
 
     private fun updateUI() {
-        val roundedDeg = displayAzimuth.roundToInt() % 360
+        val roundedDeg = (displayAzimuth.roundToInt() + 360) % 360
         degreeText.text = "${roundedDeg}°"
         directionText.text = getJapaneseDirection(roundedDeg)
 
@@ -320,7 +361,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             super.onDraw(canvas)
             val cx = width / 2f
             val cy = height / 2f
-            // 画面の横幅と高さの小さい方に合わせて自動スケーリング
             val radius = min(width, height) * 0.43f
             if (radius <= 10f) return
 
